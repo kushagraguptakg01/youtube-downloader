@@ -1,394 +1,481 @@
 import streamlit as st
-import yt_dlp
-import sys
+from pytubefix import YouTube
+from pytubefix.exceptions import RegexMatchError, VideoUnavailable
+import re
 import os
-import re # For URL validation and progress string cleaning
-import traceback # To print detailed error information
+import time
+import logging
+import math
+import subprocess # For running ffmpeg
+import shutil # For checking ffmpeg path
 
-# --- Page Config (MUST BE THE FIRST STREAMLIT COMMAND) ---
-st.set_page_config(page_title="YouTube Downloader", layout="centered")
+# --- Configuration & Constants ---
+DOWNLOAD_DIR = "downloads"
+TEMP_DIR = os.path.join(DOWNLOAD_DIR, "temp") # Temp dir for DASH parts
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
 
-# --- Configuration ---
-OUTPUT_DIR = "downloads"
-if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
+PROGRESS_UPDATE_INTERVAL_SECS = 0.5
 
-# --- Helper Function: YouTube URL Validation ---
-@st.cache_data # Cache the regex compilation
-def compile_youtube_regex():
-    pattern = re.compile(
-        r'^(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})'
-    )
-    return pattern
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-YOUTUBE_REGEX = compile_youtube_regex()
+# --- Helper Functions ---
+YOUTUBE_REGEX = re.compile(
+    r'(https?://)?(www\.)?'
+    '(youtube|youtu|youtube-nocookie)\.(com|be)/'
+    '(watch\?v=|embed/|v/|.+\?v=|shorts/|live/)?([^&=%\?]{11})'
+)
 
 def is_valid_youtube_url(url):
-    """Checks if the URL matches common YouTube video patterns."""
-    if not url:
+    return bool(YOUTUBE_REGEX.match(url))
+
+def sanitize_filename(title):
+    sanitized = re.sub(r'[\\/*?:"<>|]', "", title).strip()
+    sanitized = re.sub(r'\s+', '_', sanitized)
+    # Avoid names starting with '.' or having consecutive dots
+    sanitized = re.sub(r'^\.|\.\.+', '_', sanitized)
+    return sanitized[:100] # Limit length
+
+@st.cache_data(show_spinner=False) # Cache the ffmpeg check result
+def check_ffmpeg():
+    """Checks if ffmpeg is installed and accessible."""
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        logging.info(f"ffmpeg found at: {ffmpeg_path}")
+        return True
+    else:
+        logging.error("ffmpeg not found in system PATH.")
         return False
-    return YOUTUBE_REGEX.match(url) is not None
 
-# --- Streamlit UI ---
-st.title("🎬 YouTube Video Downloader (Compatible MP4)")
-st.caption("Enter a YouTube video URL, fetch available qualities, and download as a widely compatible MP4 (H.264/AAC).")
-st.info("ℹ️ Downloads are re-encoded for better compatibility, which may take longer. Requires FFmpeg.")
+# --- Streamlit App UI and Logic ---
+st.set_page_config(page_title="YouTube Downloader (All Qualities)", layout="centered")
+st.title("🎬 YouTube Video Downloader")
+st.markdown("Download videos in various qualities (Progressive or DASH+Merge).")
 
+# --- FFMPEG Check ---
+ffmpeg_available = check_ffmpeg()
+if not ffmpeg_available:
+    st.warning("""
+    **FFmpeg not found!** Merging higher quality video and audio (DASH) will not work.
+    Please install FFmpeg and ensure it's in your system's PATH.
+    Only lower-quality 'Progressive' downloads might be available.
+    See [ffmpeg.org](https://ffmpeg.org/download.html) for installation instructions.
+    """)
 
-# --- Session State Initialization ---
-defaults = {
-    'video_info': None, 'download_status': None, 'progress': 0.0,
-    'status_message': "", 'final_filename': None, 'error_message': None,
-    'status_text_success': False, 'status_text_error': False,
-    'current_url': "", 'last_fetched_url': None,
-    'progress_bar_text': "" # Add state for progress bar text
+# --- State Management ---
+default_state = {
+    'video_info': None, 'error_message': None, 'download_in_progress': False,
+    'download_complete': False, 'downloaded_file_path': None,
+    'downloaded_file_name': None, 'downloaded_file_size': None,
+    'last_submitted_url': "", 'last_progress': -1, 'last_update_time': 0,
+    'streams_fetched': False, 'progressive_streams': [], 'adaptive_video_streams': [],
+    'adaptive_audio_streams': [], 'download_mode': 'Progressive', # Default mode
+    'merge_status': ''
 }
-for key, value in defaults.items():
+for key, value in default_state.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-# --- URL Input Form ---
-with st.form("url_form"):
-    url_input = st.text_input(
-        "YouTube Video URL:",
-        value=st.session_state.current_url,
-        key="video_url_input",
-        placeholder="e.g., https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    )
-    submitted = st.form_submit_button("Fetch Video Info")
+# --- URL Input and Submission ---
+url = st.text_input("Enter YouTube Video URL:", placeholder="e.g., https://www.youtube.com/watch?v=...", key="url_input")
+submit_button = st.button("Fetch Video Info")
 
-    if submitted:
-        st.session_state.current_url = url_input
-        # Reset states for new fetch attempt
-        st.session_state.video_info = None
-        st.session_state.download_status = None
-        st.session_state.final_filename = None
-        st.session_state.error_message = None
-        st.session_state.status_text_success = False
-        st.session_state.status_text_error = False
-        st.session_state.progress = 0.0
-        st.session_state.progress_bar_text = "" # Reset progress text
+# --- Processing Logic ---
+if submit_button and url:
+    # Reset state if URL changes
+    if url != st.session_state.last_submitted_url:
+        logging.info(f"New URL submitted: {url}. Resetting state.")
+        for key, value in default_state.items():
+            st.session_state[key] = value
+            # Keep ffmpeg check status
+            st.session_state.ffmpeg_available = ffmpeg_available
+        st.session_state.last_submitted_url = url
 
-        if is_valid_youtube_url(url_input):
-            if url_input != st.session_state.last_fetched_url:
-                st.session_state.download_status = 'fetching'
-            else:
-                # If URL is the same, go back to selection if info exists
-                st.session_state.download_status = 'selecting' if st.session_state.video_info else 'fetching'
-        else:
-            st.error("Invalid YouTube URL format. Please enter a valid link.")
-            st.session_state.download_status = 'error'
-            st.session_state.error_message = "Invalid URL format entered."
-            st.session_state.status_text_error = True # Flag to prevent duplicate msg
+    # Validate URL
+    if not is_valid_youtube_url(url):
+        st.session_state.error_message = "Invalid YouTube URL format."
+        st.session_state.streams_fetched = False
+    # Proceed if URL is valid and different or if fetch failed previously
+    elif not st.session_state.streams_fetched or url != st.session_state.last_submitted_url:
+        st.session_state.error_message = None # Clear previous errors for this attempt
+        st.session_state.streams_fetched = False # Mark as not fetched yet for this attempt
+        st.session_state.progressive_streams = []
+        st.session_state.adaptive_video_streams = []
+        st.session_state.adaptive_audio_streams = []
 
-# --- Fetching Logic ---
-if st.session_state.download_status == 'fetching':
-    with st.spinner(f"Fetching info for: {st.session_state.current_url}..."):
+        info_placeholder = st.empty()
+        info_placeholder.info("⏳ Fetching video info and available streams...")
         try:
-            # Options to get video info efficiently
-            ydl_opts_info = {
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-                'noplaylist': True
-            }
-            with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-                info_dict = ydl.extract_info(st.session_state.current_url, download=False)
-                video_title = info_dict.get('title', 'Unknown Title')
-                formats = info_dict.get('formats', [])
+            logging.info(f"Fetching info for URL: {url} using pytubefix")
+            yt = YouTube(url)
+            yt.check_availability()
+            title = yt.title
+            logging.info(f"Video Title: {title}")
 
-            # Filter for video-only formats (for later merging with best audio)
-            available_qualities = {}
-            for f in formats:
-                # Ensure it's video-only, has resolution
-                if f.get('vcodec') != 'none' and f.get('height') is not None and f.get('acodec') == 'none':
-                    height = f.get('height')
-                    fps = f.get('fps')
-                    tbr = f.get('tbr') # Target bitrate might help differentiate
-                    label = f"{height}p" + (f"{int(round(fps))}" if fps and fps > 30 else "")
-                    # Use a tuple for sorting (height, fps, bitrate)
-                    quality_key = (height, fps if fps else 0, tbr if tbr else 0)
+            # --- Fetch ALL relevant streams ---
+            all_streams = yt.streams
 
-                    # Store the best format found for a given label (e.g., 720p)
-                    if label not in available_qualities or quality_key > available_qualities[label]['key']:
-                         available_qualities[label] = {
-                             'label': label,
-                             'height': height,
-                             'fps': fps,
-                             'format_id': f['format_id'],
-                             'vcodec': f.get('vcodec', 'unknown'), # Store codec info
-                             'key': quality_key # For sorting/selection
-                         }
+            # Progressive MP4 (Video+Audio) - Usually max 720p
+            st.session_state.progressive_streams = all_streams.filter(
+                progressive=True, file_extension='mp4'
+            ).order_by('resolution').desc().itag_index
 
-            if not available_qualities:
-                st.session_state.error_message = "Error: No suitable video-only formats found for merging."
-                st.session_state.download_status = 'error'
-            else:
-                # Sort qualities from highest to lowest based on the key (height, fps, bitrate)
-                sorted_qualities = sorted(available_qualities.values(), key=lambda item: item['key'], reverse=True)
-                st.session_state.video_info = {
-                    'title': video_title,
-                    'qualities': sorted_qualities,
-                    'url': st.session_state.current_url
-                }
-                st.session_state.download_status = 'selecting'
-                st.session_state.last_fetched_url = st.session_state.current_url # Mark URL as fetched
+            # Adaptive Video (Video Only - MP4)
+            st.session_state.adaptive_video_streams = all_streams.filter(
+                adaptive=True, only_video=True, file_extension='mp4'
+            ).order_by('resolution').desc().itag_index
 
-        except yt_dlp.utils.DownloadError as e:
-            st.session_state.error_message = f"Error fetching video info: {e}"
-            st.session_state.download_status = 'error'
+            # Adaptive Audio (Audio Only - typically m4a/mp4 or webm)
+            st.session_state.adaptive_audio_streams = all_streams.filter(
+                adaptive=True, only_audio=True
+            ).order_by('abr').desc().itag_index # Order by bitrate
+
+            logging.info(f"Found {len(st.session_state.progressive_streams)} progressive streams.")
+            logging.info(f"Found {len(st.session_state.adaptive_video_streams)} adaptive video streams.")
+            logging.info(f"Found {len(st.session_state.adaptive_audio_streams)} adaptive audio streams.")
+
+            st.session_state.video_info = {'title': title, 'yt_object': yt}
+            st.session_state.streams_fetched = True
+            st.session_state.download_complete = False
+            st.session_state.merge_status = ''
+
+            # Check if any streams were found
+            if not st.session_state.progressive_streams and \
+               not st.session_state.adaptive_video_streams:
+                st.session_state.error_message = "Could not find any downloadable video streams for this URL."
+                st.session_state.streams_fetched = False # Mark as failed
+
+        except VideoUnavailable:
+            logging.error(f"VideoUnavailable for URL: {url}")
+            st.session_state.error_message = "Video is unavailable (private, deleted, or restricted)."
+            st.session_state.streams_fetched = False
+        except RegexMatchError:
+             logging.error(f"RegexMatchError for URL: {url}")
+             st.session_state.error_message = "Failed to parse YouTube URL format."
+             st.session_state.streams_fetched = False
         except Exception as e:
-            st.session_state.error_message = f"An unexpected error occurred during info fetch: {e}"
-            st.session_state.download_status = 'error'
-            # Also print unexpected errors during fetch to console for debugging
-            print(f"\n--- UNEXPECTED ERROR DURING FETCH ---")
-            print(f"URL: {st.session_state.current_url}")
-            print(f"Exception Type: {type(e)}")
-            print(f"Exception Details: {e}")
-            traceback.print_exc() # Print the full traceback
+            logging.exception(f"Unexpected error fetching video info for {url}: {e}")
+            st.session_state.error_message = f"An error occurred fetching info: {str(e)[:150]}..."
+            st.session_state.streams_fetched = False
+        finally:
+             info_placeholder.empty()
 
+# --- Display Errors or Status ---
+if st.session_state.error_message and st.session_state.last_submitted_url == url:
+    st.error(st.session_state.error_message)
 
-# --- Display Error (if fetch failed) ---
-# This handles errors specifically from the 'fetching' block above
-if st.session_state.download_status == 'error' and st.session_state.error_message:
-    # Only display error if it hasn't been shown via st.error or the download block yet
-    if not st.session_state.get("status_text_error", False):
-        if "Invalid URL format entered." not in st.session_state.error_message: # Avoid repeating URL format error
-            st.error(st.session_state.error_message)
-            st.session_state.status_text_error = True # Flag that error was shown
+# --- Display Options if Streams Fetched ---
+if st.session_state.streams_fetched and st.session_state.last_submitted_url == url \
+   and not st.session_state.download_complete and not st.session_state.download_in_progress:
 
+    st.subheader(f"Video Title: {st.session_state.video_info['title']}")
 
-# --- Display Video Info and Quality Selection ---
-if st.session_state.download_status == 'selecting' and st.session_state.video_info:
-    info = st.session_state.video_info
-    st.divider()
-    st.subheader(f"Video Found: {info['title']}")
-    quality_options = [q['label'] for q in info['qualities']]
+    # --- Download Mode Selection ---
+    modes = ["Progressive (Simpler, Max ~720p)"]
+    if ffmpeg_available and st.session_state.adaptive_video_streams and st.session_state.adaptive_audio_streams:
+        modes.append("Highest Quality (DASH - Requires Merge)")
 
-    if not quality_options:
-         st.warning("No downloadable video qualities detected for merging.")
-         st.session_state.download_status = 'error' # Treat as error if no options
-         st.session_state.error_message = "Could not find any video quality options for merging."
-         if not st.session_state.get("status_text_error", False): # Avoid duplicate display
-             st.error(st.session_state.error_message)
-             st.session_state.status_text_error = True
+    if len(modes) > 1:
+         selected_mode = st.radio(
+              "Choose Download Type:",
+              options=modes,
+              key="mode_radio",
+              horizontal=True,
+         )
+         # Extract mode name for logic
+         st.session_state.download_mode = "Progressive" if "Progressive" in selected_mode else "DASH"
+    elif "Progressive" in modes:
+         st.session_state.download_mode = "Progressive"
+         st.info("Only Progressive download options available.")
     else:
-        selected_quality_label = st.radio(
-            "Select Video Quality:",
-            options=quality_options,
-            index=0, # Default to highest quality
-            key="quality_choice",
-            horizontal=True
-        )
-        # Find the full info dictionary for the selected quality label
-        chosen_quality_info = next((q for q in info['qualities'] if q['label'] == selected_quality_label), None)
+         st.error("No downloadable streams found.")
+         st.stop() # Stop execution if no options
 
-        # --- Download Button & Logic ---
-        if chosen_quality_info and st.button(f"Download {selected_quality_label} (MP4)", key="download_button"):
-            # Reset state specifically for this download attempt
-            st.session_state.download_status = 'downloading'
-            st.session_state.progress = 0.0
-            st.session_state.status_message = "Initializing download..."
-            st.session_state.final_filename = None
-            st.session_state.error_message = None
-            st.session_state.status_text_success = False # Reset display flags
-            st.session_state.status_text_error = False  # Reset display flags
-            st.session_state.progress_bar_text = "Initializing..." # Initial progress bar text
+    download_button_pressed = False
+    selected_stream_itag = None
+    selected_video_itag = None
+    selected_audio_itag = None
 
-            # --- Create placeholders for dynamic progress UI ---
-            progress_container = st.container()
-            progress_text = progress_container.empty()
-            progress_bar = progress_container.progress(0.0, text=st.session_state.progress_bar_text)
+    # --- Quality Selection UI (Conditional) ---
+    st.markdown("---")
+    if st.session_state.download_mode == "Progressive":
+        st.subheader("Progressive Download Options")
+        prog_options_dict = {}
+        for itag, s in st.session_state.progressive_streams.items():
+             label = f"{s.resolution} ({s.filesize_mb:.1f} MB, {s.mime_type})"
+             prog_options_dict[label] = itag
 
-            # --- Modified Progress Hook ---
-            def hook(d):
-                # --- Hook code remains the same ---
-                if d['status'] == 'downloading':
-                    percent_str = d.get('_percent_str', '0%').strip()
-                    percent_clean = re.sub(r'\x1b\[[0-9;]*m', '', percent_str).replace('%','').strip()
-                    try: progress_value = max(0.0, min(1.0, float(percent_clean) / 100.0))
-                    except ValueError: progress_value = st.session_state.progress # Keep last known value
-                    speed = d.get('_speed_str', 'N/A').strip(); eta = d.get('_eta_str', 'N/A').strip()
-                    st.session_state.progress = progress_value
-                    st.session_state.progress_bar_text = f"{int(progress_value * 100)}% | Speed: {speed} | ETA: {eta}"
-                    try:
-                        if st.session_state.download_status == 'downloading':
-                            progress_text.markdown(f"**Status:** Downloading `{info['title']}`...")
-                            progress_bar.progress(progress_value, text=st.session_state.progress_bar_text)
-                    except Exception as ui_update_error: print(f"Debug: Error updating UI in hook (downloading): {ui_update_error}")
-                elif d['status'] == 'finished':
-                    st.session_state.progress_bar_text = "Processing/Merging..."
-                    try:
-                        if st.session_state.download_status == 'downloading':
-                            progress_text.markdown(f"**Status:** Processing video components...")
-                            progress_bar.progress(1.0, text=st.session_state.progress_bar_text)
-                    except Exception as ui_update_error: print(f"Debug: Error updating UI in hook (finished): {ui_update_error}")
-                elif d['status'] == 'error':
-                     st.session_state.download_status = 'error'
-                     st.session_state.error_message = "yt-dlp reported an error during download/processing."
-                     st.session_state.progress_bar_text = "❌ Error!"
-                     try:
-                        if not st.session_state.get("status_text_error", False):
-                            progress_text.markdown("**Status:** Error reported by downloader.")
-                            progress_bar.progress(1.0, text=st.session_state.progress_bar_text)
-                            st.session_state.status_text_error = True # Flag hook handled UI error
-                     except Exception as ui_update_error: print(f"Debug: Error updating UI in hook (error): {ui_update_error}")
-            # --- End of Hook ---
+        if not prog_options_dict:
+            st.warning("No progressive streams found for this video.")
+        else:
+            selected_prog_label = st.selectbox(
+                "Select Quality (Video+Audio Combined):",
+                options=list(prog_options_dict.keys()),
+                key="prog_quality_select"
+            )
+            selected_stream_itag = prog_options_dict[selected_prog_label]
+            download_button_pressed = st.button(f"Download ({selected_prog_label})", key="download_prog_button")
 
-            # --- Prepare Download Options (CORRECTED) ---
-            format_selector = f"{chosen_quality_info['format_id']}+bestaudio/best"
-            safe_title = re.sub(r'[\\/*?:"<>|]', "", info['title'])[:100]
-            quality_tag = chosen_quality_info['label']
-            base_output_name = f'{safe_title} [{quality_tag}]'
-            output_template = os.path.join(OUTPUT_DIR, f'{base_output_name}.%(ext)s')
-            final_expected_path = os.path.join(OUTPUT_DIR, f'{base_output_name}.mp4')
+    elif st.session_state.download_mode == "DASH":
+        st.subheader("Highest Quality (DASH) Options")
+        if not ffmpeg_available:
+             st.error("Cannot perform DASH download because FFmpeg is missing.")
+        else:
+            # Video Selection
+            vid_options_dict = {}
+            for itag, s in st.session_state.adaptive_video_streams.items():
+                label = f"{s.resolution} ({s.fps}fps, {s.filesize_mb:.1f} MB, {s.video_codec})"
+                vid_options_dict[label] = itag
 
-            # --- yt-dlp Options with Forced Re-encoding (CORRECTED STRUCTURE) ---
-            ydl_opts_download = {
-                'format': format_selector,
-                'outtmpl': output_template, # Where temp files might go
-                'progress_hooks': [hook],
-                'noplaylist': True,
-                'merge_output_format': 'mp4', # Request MP4 container
+            selected_vid_label = st.selectbox(
+                "Select Video Quality (Video Only):",
+                options=list(vid_options_dict.keys()),
+                key="vid_quality_select"
+            )
+            selected_video_itag = vid_options_dict[selected_vid_label]
 
-                # --- Define Postprocessors (without args inside) ---
-                'postprocessors': [
-                    # 1. Specify the converter and target format
-                    {'key': 'FFmpegVideoConvertor',
-                     'preferedformat': 'mp4'},
-                    # 2. Add metadata
-                    {'key': 'FFmpegMetadata', 'add_metadata': True},
-                    # 3. Optional: Embed subtitles
-                    # {'key': 'FFmpegEmbedSubtitle'}
-                ],
-
-                # --- Pass FFmpeg args globally for postprocessing ---
-                # These arguments will be added to the FFmpeg command line
-                # when yt-dlp calls FFmpeg for postprocessing tasks like conversion.
-                'postprocessor_args': [
-                     '-c:v', 'libx264',        # Video Codec: H.264 (AVC)
-                     '-c:a', 'aac',            # Audio Codec: AAC
-                     '-crf', '23',             # Constant Rate Factor (Quality: ~18=high, 23=good, 28=low)
-                     '-preset', 'medium',      # Encoding Speed vs Compression
-                     '-pix_fmt', 'yuv420p',     # Pixel format for broad compatibility
-                     '-movflags', '+faststart' # Optimize for streaming/web playback
-                ],
-                # --- End of FFmpeg global arguments ---
-
-                 'quiet': True,       # Suppress yt-dlp console output
-                 'no_warnings': True, # Suppress yt-dlp warnings
-                 'verbose': False,    # No verbose debug output
-                 'ignoreerrors': False, # Stop on download/processing errors
-                 'fixup': 'warn',     # Try to fix minor issues if possible
-                 # 'keepvideo': True, # Uncomment if you want to keep original downloaded files on error
-            }
-            # --- End of yt-dlp Options ---
-
-            # --- Execute Download ---
-            try:
-                progress_text.markdown(f"**Status:** Initializing download & processing...")
-                progress_bar.progress(0.0, text="Starting...")
-
-                with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
-                    ydl.download([info['url']])
-
-                # --- Post-Download Check ---
-                if st.session_state.download_status != 'error':
-                    if os.path.exists(final_expected_path):
-                        st.session_state.download_status = 'finished'
-                        st.session_state.final_filename = final_expected_path
-                        st.session_state.status_message = f"Download and conversion successful: {os.path.basename(final_expected_path)}"
-                        st.session_state.progress_bar_text = "✅ Download Successful!"
-                        progress_text.markdown(f"**Status:** Completed!")
-                        progress_bar.progress(1.0, text=st.session_state.progress_bar_text)
-                        st.session_state.status_text_success = True
-                    else:
-                        st.session_state.download_status = 'error'
-                        st.session_state.final_filename = None
-                        found_other_file = None
-                        try:
-                            for f in os.listdir(OUTPUT_DIR):
-                                if f.startswith(base_output_name): found_other_file = f; break
-                        except OSError: pass
-                        if found_other_file: st.session_state.error_message = f"Processing OK, but final file is '{found_other_file}' instead of '.mp4'. Check FFmpeg setup or codecs."
-                        else: st.session_state.error_message = "Processing finished, but the final MP4 file was not found. FFmpeg conversion likely failed silently."
-                        st.session_state.progress_bar_text = "❌ Error: Output File Issue!"
-                        if not st.session_state.get("status_text_error", False):
-                            progress_text.markdown("**Status:** Error during final file check.")
-                            progress_bar.progress(1.0, text=st.session_state.progress_bar_text)
-                            st.session_state.status_text_error = True
-
-            except yt_dlp.utils.DownloadError as e:
-                if st.session_state.download_status != 'error':
-                    st.session_state.download_status = 'error'
-                    err_str = str(e).lower()
-                    if "ffmpeg" in err_str or "post-process" in err_str or "conversion" in err_str: st.session_state.error_message = f"Download/Conversion Error (FFmpeg issue likely): {e}. Ensure FFmpeg is installed and accessible."
-                    else: st.session_state.error_message = f"yt-dlp Download Error: {e}"
-                    st.session_state.progress_bar_text = "❌ Error during download/process!"
-                    if not st.session_state.get("status_text_error", False):
-                        try:
-                            progress_text.markdown("**Status:** Error")
-                            progress_bar.progress(1.0, text=st.session_state.progress_bar_text)
-                        except Exception: pass
-                        st.session_state.status_text_error = True
-
-            except Exception as e: # Catch any other unexpected errors
-                 if st.session_state.download_status != 'error':
-                    st.session_state.download_status = 'error'
-                    st.session_state.error_message = f"An unexpected error occurred: {e}"
-                    # --- DEBUG PRINTING ---
-                    print(f"\n--- UNEXPECTED ERROR CAUGHT DURING DOWNLOAD/PROCESS ---")
-                    print(f"URL: {info.get('url', 'N/A')}")
-                    print(f"Chosen Quality: {chosen_quality_info}")
-                    print(f"FFmpeg Options Used (Postprocessors): {ydl_opts_download.get('postprocessors', [])}")
-                    print(f"FFmpeg Options Used (Args): {ydl_opts_download.get('postprocessor_args', [])}")
-                    print(f"Exception Type: {type(e)}")
-                    print(f"Exception Details: {e}")
-                    traceback.print_exc()
-                    # --- END DEBUG PRINTING ---
-                    st.session_state.progress_bar_text = "❌ Unexpected Error!"
-                    if not st.session_state.get("status_text_error", False):
-                        try:
-                             progress_text.markdown("**Status:** Error")
-                             progress_bar.progress(1.0, text=st.session_state.progress_bar_text)
-                        except Exception: pass
-                        st.session_state.status_text_error = True
+            # Audio Selection
+            aud_options_dict = {}
+            for itag, s in st.session_state.adaptive_audio_streams.items():
+                 label = f"{s.abr} ({s.filesize_mb:.1f} MB, {s.audio_codec})"
+                 # Ensure unique labels if multiple streams have same abr/size/codec
+                 count = 1
+                 base_label = label
+                 while label in aud_options_dict:
+                     label = f"{base_label} #{count+1}"
+                     count += 1
+                 aud_options_dict[label] = itag
 
 
-# --- Display Download Button or Final Error Message ---
-final_status_placeholder = st.empty()
+            selected_aud_label = st.selectbox(
+                "Select Audio Quality (Audio Only):",
+                options=list(aud_options_dict.keys()),
+                key="aud_quality_select"
+            )
+            selected_audio_itag = aud_options_dict[selected_aud_label]
 
-if st.session_state.download_status == 'finished' and st.session_state.final_filename:
-    with final_status_placeholder.container():
-        try:
-            with open(st.session_state.final_filename, "rb") as fp:
-                st.download_button(
-                    label=f"Download {os.path.basename(st.session_state.final_filename)}",
-                    data=fp,
-                    file_name=os.path.basename(st.session_state.final_filename),
-                    mime="video/mp4",
-                    key="download_final_button"
+            download_button_pressed = st.button(f"Download & Merge ({vid_options_dict[selected_vid_label]} + {aud_options_dict[selected_aud_label]})", key="download_dash_button")
+
+
+    # --- Download Execution ---
+    if download_button_pressed:
+        st.session_state.download_in_progress = True
+        st.session_state.error_message = None
+        st.session_state.download_complete = False
+        st.session_state.downloaded_file_path = None
+        st.session_state.merge_status = ''
+        st.session_state.last_progress = -1
+        st.session_state.last_update_time = 0
+
+        progress_bar_placeholder = st.empty()
+        status_text_placeholder = st.empty()
+        progress_bar = progress_bar_placeholder.progress(0)
+        status_text = status_text_placeholder.info("🚀 Initializing...")
+        start_time = time.time()
+
+        # --- Progress Callback ---
+        def progress_callback(stream, chunk, bytes_remaining):
+            current_time = time.time()
+            total_size = stream.filesize or 0 # Handle None filesize
+            if total_size == 0: return # Cannot calculate percentage
+
+            bytes_downloaded = total_size - bytes_remaining
+            percentage = int((bytes_downloaded / total_size) * 100)
+
+            # Determine phase for combined progress bar (optional complexity)
+            # Simple approach: Update bar per file, reset in between
+            progress_bar.progress(percentage) # Update for current file
+
+            if percentage > st.session_state.last_progress or \
+               (current_time - st.session_state.last_update_time) > PROGRESS_UPDATE_INTERVAL_SECS:
+                elapsed_time = current_time - start_time # Use overall start time
+                speed_mbps = (bytes_downloaded / (elapsed_time + 1e-9)) / (1024 * 1024)
+                eta_seconds = (bytes_remaining / (bytes_downloaded / (elapsed_time + 1e-9))) if bytes_downloaded > 0 else 0
+
+                # Update status text based on current operation (set outside callback)
+                current_status = st.session_state.get('current_download_phase', 'Downloading')
+                status_text.info(
+                    f"⏳ {current_status}... {percentage}% "
+                    f"({bytes_downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB) | "
+                    f"Speed: {speed_mbps:.2f} MB/s | "
+                    f"ETA: {math.ceil(eta_seconds)}s"
                 )
-        except FileNotFoundError:
-            if not st.session_state.get("status_text_error", False):
-                 final_status_placeholder.error(f"Error: The downloaded file '{st.session_state.final_filename}' could not be found for the download button.")
-                 st.session_state.download_status = 'error'
-                 st.session_state.status_text_error = True
+                st.session_state.last_progress = percentage
+                st.session_state.last_update_time = current_time
+
+        # --- Get YT object ---
+        if 'yt_object' not in st.session_state.video_info:
+            st.error("Session expired or invalid. Please fetch video info again.")
+            st.session_state.download_in_progress = False
+            st.stop()
+        yt = st.session_state.video_info['yt_object']
+        yt.register_on_progress_callback(progress_callback) # Register callback
+
+        # --- Download Path ---
+        try:
+            if st.session_state.download_mode == "Progressive" and selected_stream_itag:
+                st.session_state.current_download_phase = "Downloading Progressive"
+                stream_to_download = yt.streams.get_by_itag(selected_stream_itag)
+                if not stream_to_download: raise Exception(f"Progressive stream {selected_stream_itag} not found.")
+
+                status_text.info(f"Downloading {stream_to_download.resolution}...")
+                st.session_state.last_progress = -1 # Reset progress for this file
+                st.session_state.last_update_time = time.time()
+
+                base_filename = sanitize_filename(st.session_state.video_info['title'])
+                quality_tag = stream_to_download.resolution or "prog"
+                final_filename = f"{base_filename}_{quality_tag}.mp4"
+                st.session_state.downloaded_file_name = final_filename
+
+                downloaded_path = stream_to_download.download(
+                    output_path=DOWNLOAD_DIR, filename=final_filename
+                )
+                st.session_state.downloaded_file_path = downloaded_path
+
+            elif st.session_state.download_mode == "DASH" and selected_video_itag and selected_audio_itag:
+                if not ffmpeg_available: raise Exception("FFmpeg is required for DASH downloads but not found.")
+
+                video_stream = yt.streams.get_by_itag(selected_video_itag)
+                audio_stream = yt.streams.get_by_itag(selected_audio_itag)
+                if not video_stream: raise Exception(f"Video stream {selected_video_itag} not found.")
+                if not audio_stream: raise Exception(f"Audio stream {selected_audio_itag} not found.")
+
+                base_filename = sanitize_filename(st.session_state.video_info['title'])
+                vid_res_tag = video_stream.resolution or "vid"
+                aud_abr_tag = audio_stream.abr or "aud"
+                final_filename = f"{base_filename}_{vid_res_tag}_{aud_abr_tag}.mp4"
+                st.session_state.downloaded_file_name = final_filename
+                final_filepath = os.path.join(DOWNLOAD_DIR, final_filename)
+
+                # Temporary file paths
+                temp_video_path = os.path.join(TEMP_DIR, f"{base_filename}_vid.mp4")
+                # Audio extension might not be mp4, use what pytube gives if possible
+                temp_audio_ext = audio_stream.mime_type.split('/')[-1]
+                temp_audio_path = os.path.join(TEMP_DIR, f"{base_filename}_aud.{temp_audio_ext}")
+
+                # --- Download Video ---
+                st.session_state.current_download_phase = "Downloading Video"
+                status_text.info(f"Downloading Video ({video_stream.resolution})...")
+                st.session_state.last_progress = -1 # Reset progress
+                st.session_state.last_update_time = time.time()
+                logging.info(f"Downloading video to {temp_video_path}")
+                video_stream.download(output_path=TEMP_DIR, filename=os.path.basename(temp_video_path))
+                logging.info("Video download complete.")
+
+                 # --- Download Audio ---
+                st.session_state.current_download_phase = "Downloading Audio"
+                status_text.info(f"Downloading Audio ({audio_stream.abr})...")
+                progress_bar.progress(0) # Reset progress bar for audio
+                st.session_state.last_progress = -1
+                st.session_state.last_update_time = time.time()
+                logging.info(f"Downloading audio to {temp_audio_path}")
+                audio_stream.download(output_path=TEMP_DIR, filename=os.path.basename(temp_audio_path))
+                logging.info("Audio download complete.")
+
+                # --- Merge with FFmpeg ---
+                yt.register_on_progress_callback(None) # Unregister callback before merging
+                progress_bar_placeholder.empty() # Remove progress bar
+                st.session_state.merge_status = "⏳ Merging video and audio using FFmpeg... (may take a moment)"
+                status_text.info(st.session_state.merge_status)
+                logging.info(f"Merging with ffmpeg: video={temp_video_path}, audio={temp_audio_path}, output={final_filepath}")
+
+                ffmpeg_command = [
+                    'ffmpeg',
+                    '-i', temp_video_path,  # Input video
+                    '-i', temp_audio_path,  # Input audio
+                    '-c:v', 'copy',         # Copy video codec (fast)
+                    '-c:a', 'copy',         # Copy audio codec (fast)
+                    '-loglevel', 'error',   # Show only errors from ffmpeg
+                    final_filepath          # Output file path
+                ]
+
+                try:
+                    process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+                    logging.info("FFmpeg merge successful.")
+                    st.session_state.merge_status = "✅ Merging complete!"
+                    status_text.success(st.session_state.merge_status)
+                    st.session_state.downloaded_file_path = final_filepath # Set final path
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"FFmpeg merge failed. Return code: {e.returncode}")
+                    logging.error(f"FFmpeg stderr: {e.stderr}")
+                    st.session_state.merge_status = f"❌ FFmpeg merge failed: {e.stderr[:200]}..." # Show part of error
+                    raise Exception(f"FFmpeg failed: {e.stderr}") # Propagate error
+                finally:
+                    # --- Cleanup Temp Files ---
+                    logging.info("Cleaning up temporary files...")
+                    if os.path.exists(temp_video_path): os.remove(temp_video_path)
+                    if os.path.exists(temp_audio_path): os.remove(temp_audio_path)
+                    logging.info("Temporary files cleaned.")
+
+            else:
+                raise Exception("No valid download option selected or available.")
+
+            # --- Final Checks Post-Download/Merge ---
+            if not st.session_state.downloaded_file_path or \
+               not os.path.exists(st.session_state.downloaded_file_path) or \
+               os.path.getsize(st.session_state.downloaded_file_path) == 0:
+                 raise Exception("Final file is missing or empty after download/merge.")
+
+            st.session_state.downloaded_file_size = os.path.getsize(st.session_state.downloaded_file_path)
+            st.session_state.download_complete = True
+            st.session_state.error_message = None
+
         except Exception as e:
-            if not st.session_state.get("status_text_error", False):
-                 final_status_placeholder.error(f"Error reading file for download button: {e}")
-                 print(f"\n--- ERROR READING FILE FOR DOWNLOAD BUTTON ---")
-                 print(f"Filename: {st.session_state.final_filename}")
-                 print(f"Exception Type: {type(e)}")
-                 print(f"Exception Details: {e}")
-                 traceback.print_exc()
-                 st.session_state.download_status = 'error'
-                 st.session_state.status_text_error = True
+            logging.exception(f"Error during download/merge process: {e}")
+            st.session_state.error_message = f"An error occurred: {str(e)[:200]}..."
+            st.session_state.download_complete = False
+            st.session_state.downloaded_file_path = None
+            # Clear progress indicators on error
+            progress_bar_placeholder.empty()
+            status_text_placeholder.empty()
 
-elif st.session_state.download_status == 'error' and st.session_state.error_message:
-     if not st.session_state.get("status_text_error", False):
-         final_status_placeholder.error(f"Failed: {st.session_state.error_message}")
+        finally:
+            # --- Final Cleanup ---
+            st.session_state.download_in_progress = False
+            st.session_state.current_download_phase = '' # Clear phase status
+            # Ensure callback is unregistered
+            if 'yt' in locals() and yt:
+                 try: yt.register_on_progress_callback(None)
+                 except Exception: pass
+             # Hide merge status if it was showing an error or is irrelevant now
+            if st.session_state.error_message and "Merging" in st.session_state.merge_status:
+                 pass # Keep merge status if it's part of the error
+            elif status_text is not None and not st.session_state.download_complete:
+                 status_text_placeholder.empty() # Clear status text if download failed elsewhere
 
+
+# --- Download Completion & Access ---
+if st.session_state.download_complete and st.session_state.downloaded_file_path:
+    # Ensure status text from download doesn't linger if merge status wasn't shown
+    if 'status_text_placeholder' in locals(): status_text_placeholder.empty()
+
+    st.success(f"✅ Download successful! ({st.session_state.download_mode})")
+    if st.session_state.merge_status and "complete" in st.session_state.merge_status:
+         st.success(st.session_state.merge_status) # Show merge success again if applicable
+
+    st.info(f"File: **{st.session_state.downloaded_file_name}** | Size: **{st.session_state.downloaded_file_size / (1024 * 1024):.2f} MB**")
+    try:
+        with open(st.session_state.downloaded_file_path, "rb") as file_data:
+            st.download_button(
+                label="📥 Save Video to Your Device",
+                data=file_data,
+                file_name=st.session_state.downloaded_file_name,
+                mime="video/mp4",
+                key="save_button"
+            )
+    except FileNotFoundError:
+        st.error("Error: Downloaded file not found. Please try again.")
+        st.session_state.download_complete = False
+        st.session_state.downloaded_file_path = None
+    except Exception as e:
+         st.error(f"An error occurred preparing download link: {e}")
+         logging.exception("Error preparing download link.")
+         st.session_state.download_complete = False
+         st.session_state.downloaded_file_path = None
 
 # --- Footer ---
-st.divider()
-st.caption("Built with Streamlit & yt-dlp. Requires FFmpeg for merging and conversion.")
+st.markdown("---")
+st.caption("Remember to respect copyright and YouTube's Terms of Service. DASH downloads require FFmpeg.")
