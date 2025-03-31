@@ -31,7 +31,7 @@ if not logger.handlers:
     logger.propagate = False
 
 # --- Helper Functions ---
-YOUTUBE_REGEX = re.compile(r'(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)([^&?/\s]{11})')
+YOUTUBE_REGEX = re.compile(r'(https?://)?((www|m)\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)([^&?/\s]{11})')
 
 def is_valid_youtube_url(url: str) -> bool:
     if not url: return False
